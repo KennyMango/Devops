@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template 
+Resources:
+  # VPC and subnets
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-west-2a
+      MapPublicIpOnLaunch: true
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-west-2b
+      MapPublicIpOnLaunch: true
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: us-west-2a
+      MapPublicIpOnLaunch: false
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: us-west-2b
+      MapPublicIpOnLaunch: false
+
+  # Security group for web servers
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: my-app-revision-bucket
+      ServerSideEncryptionConfiguration:
+        ServerSideEncryptionByDefault:
+          SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+        
+  MyIAMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref MyIAMRoleForAutoscaling
+      
+  MyIAMRoleForAutoscaling:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: MyIAMPolicyForAutoscaling
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+              - autoscaling:DescribeAutoScalingGroups
+              - autoscaling:DescribeAutoScalingInstances
+              - autoscaling:DescribeLaunchConfigurations
+              - autoscaling:DescribeTags
+              - ec2:DescribeInstances
+              - ec2:DescribeTags
+              Resource: "*"
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-0ceecbb0f30a902a6
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref MyIAMInstanceProfile
+      SecurityGroups:
+      - !Ref SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+         #!/bin/bash
+         yum update -y
+         yum install -y unzip
+         mkdir /var/www/html/app
+         aws s3 cp s3://my-app-revision-bucket/my-app.zip /tmp/my-app.zip
+         unzip /tmp/my-app.zip -d /var/www/html/app
+         rm /tmp/my-app.zip
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - !Ref PrivateSubnet1
+      - !Ref PrivateSubnet2
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+
+  CodeDeployApplication:
+      Type: AWS::CodeDeploy::Application
+      Properties:
+        ApplicationName: my-app
+  CodeDeployDeploymentGroup:
+      Type: AWS::CodeDeploy::DeploymentGroup
+      Properties:
+        ApplicationName: !Ref CodeDeployApplication
+        DeploymentGroupName: my-app-deployment-group
+        DeploymentConfigName: CodeDeployDefault.OneAtATime
+        Ec2TagFilters:
+        - Key: Name
+          Value: web-server
+          Type: KEY_AND_VALUE
+        ServiceRoleArn: arn:aws:iam::123456789012:role/CodeDeployRole
+        AutoScalingGroups:
+        - !Ref AutoScalingGroup
+        
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: my-bucket-python
+        S3Key: lamda_function.zip
+      Handler: index.handler
+      Role: !GetAtt MyIAMRole.Arn
+      Runtime: python3.9
+      
+  MyIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: MyIAMPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - sns:Publish
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: "*"
+              
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: kennethtestsns
+      TopicName: kennethtestsns
+      
+Outputs:
+  SnsTopicArn:
+    Value: !Ref MySNSTopic
+    Export:
+      Name: SnsTopicArn
